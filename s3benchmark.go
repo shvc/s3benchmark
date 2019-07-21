@@ -39,16 +39,6 @@ var version = "2.1.1"
 
 // TODO: avoid different threads download the same object
 
-// Global variables
-var accessKey, secretKey, endpoint, bucket, region string
-var durationSecs, threads, loops int
-var objectSize uint64
-var objectData []byte
-
-//var objectDataMd5 string
-var uploadCount, downloadCount, deleteCount, uploadFailedCount, downloadFailedCount, deleteFailedCount int32
-var endtime, uploadFinish, downloadFinish, deleteFinish time.Time
-
 func logit(msg string) {
 	fmt.Println(msg)
 	logfile, _ := os.OpenFile("s3benchmark.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
@@ -86,7 +76,7 @@ var HTTPTransport http.RoundTripper = &http.Transport{
 
 var httpClient = &http.Client{Transport: HTTPTransport}
 
-func getS3Client() *s3.S3 {
+func getS3Client(accessKey, secretKey, region, endpoint string) *s3.S3 {
 	// Build our config
 	creds := credentials.NewStaticCredentials(accessKey, secretKey, "")
 	loglevel := aws.LogOff
@@ -109,9 +99,9 @@ func getS3Client() *s3.S3 {
 	return client
 }
 
-func createBucket() {
+func createBucket(accessKey, secretKey, region, endpoint, bucket string) {
 	// Get a client
-	client := getS3Client()
+	client := getS3Client(accessKey, secretKey, region, endpoint)
 	// Create our bucket (may already exist without error)
 	in := &s3.CreateBucketInput{Bucket: aws.String(bucket)}
 	if _, err := client.CreateBucket(in); err != nil {
@@ -128,9 +118,9 @@ func createBucket() {
 	}
 }
 
-func deleteAllObjects(prefix string) {
+func deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, prefix string) {
 	// Get a client
-	client := getS3Client()
+	client := getS3Client(accessKey, secretKey, region, endpoint)
 	// Use multiple routines to do the actual delete
 	var wg sync.WaitGroup
 	var keyMarker *string
@@ -210,7 +200,7 @@ func hmacSHA1(key []byte, content string) []byte {
 	return mac.Sum(nil)
 }
 
-func setSignature(req *http.Request) {
+func setSignature(accessKey, secretKey string, req *http.Request) {
 	// Setup default parameters
 	dateHdr := time.Now().UTC().Format(time.RFC1123)
 	req.Header.Set("X-Amz-Date", dateHdr)
@@ -225,6 +215,9 @@ func setSignature(req *http.Request) {
 }
 
 func main() {
+	var accessKey, secretKey, endpoint, bucket, region string
+	var durationSecs, threads, loops int
+
 	flag.StringVar(&accessKey, "a", "object_user1", "Access key")
 	flag.StringVar(&secretKey, "s", "ChangeMeChangeMeChangeMeChangeMeChangeMe", "Secret key")
 	flag.StringVar(&endpoint, "e", "http://192.168.55.2:9020", "S3 Endpoint URL")
@@ -243,18 +236,22 @@ func main() {
 	if secretKey == "" {
 		log.Fatal("Missing argument -s for secret key.")
 	}
-	var err error
-	if objectSize, err = bytefmt.ToBytes(*sizeArg); err != nil {
+
+	objectSize, err := bytefmt.ToBytes(*sizeArg)
+	if err != nil {
 		log.Fatalf("Invalid -z argument for object size: %v", err)
 	}
 	hostname := getHostname()
+	//var objectDataMd5 string
+	var totalUploadCount, totalDownloadCount, totalDeleteCount int32
+	var totalUploadFailedCount, totalDownloadFailedCount, totalDeleteFailedCount int32
 
 	fmt.Printf("s3benchmark %s v%s\n", hostname, version)
 	logit(fmt.Sprintf("url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s(%d)",
 		endpoint, bucket, region, durationSecs, threads, loops, *sizeArg, objectSize))
 
 	// Initialize data
-	objectData = make([]byte, objectSize)
+	objectData := make([]byte, objectSize)
 	if n, e := rand.Read(objectData); e != nil {
 		log.Fatalf("generate random data failed: %s", e)
 	} else if uint64(n) < objectSize {
@@ -266,20 +263,19 @@ func main() {
 	//objectDataMd5 = base64.StdEncoding.EncodeToString(hasher.Sum(nil))
 
 	// Create the Bucket and delete the Objects
-	createBucket()
-	deleteAllObjects(hostname)
+	createBucket(accessKey, secretKey, region, endpoint, bucket)
+	deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, hostname)
 
+	var totalUploadTime, totalDownloadTime, totalDeleteTime float64
 	// Loop running the tests
 	logit("Loop\tMethod\t  Objects\tElapsed(s)\t Throuphput\t   TPS\t Failed")
 	for loop := 1; loop <= loops; loop++ {
-		uploadCount = 0
-		uploadFailedCount = 0
-		downloadCount = 0
-		downloadFailedCount = 0
-		deleteCount = 0
-		deleteFailedCount = 0
+		var uploadCount, uploadFailedCount int32
+		var downloadCount, downloadFailedCount int32
+		var deleteCount, deleteFailedCount int32
+		var uploadFinish, downloadFinish, deleteFinish time.Time
 		starttime := time.Now()
-		endtime = starttime.Add(time.Second * time.Duration(durationSecs))
+		endtime := starttime.Add(time.Second * time.Duration(durationSecs))
 		wg := sync.WaitGroup{}
 		for n := 1; n <= threads; n++ {
 			wg.Add(1)
@@ -291,14 +287,14 @@ func main() {
 					req, _ := http.NewRequest(http.MethodPut, prefix, fileobj)
 					req.Header.Set("Content-Length", strconv.FormatUint(objectSize, 10))
 					//req.Header.Set("Content-MD5", objectDataMd5)
-					setSignature(req)
+					setSignature(accessKey, secretKey, req)
 					if resp, err := httpClient.Do(req); err != nil {
 						log.Fatalf("FATAL: Error uploading object %s: %v", prefix, err)
-					} else if resp != nil && resp.StatusCode != http.StatusOK {
-						if resp.StatusCode == http.StatusServiceUnavailable {
-							atomic.AddInt32(&uploadFailedCount, 1)
-							atomic.AddInt32(&uploadCount, -1)
-						} else {
+					} else if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+						atomic.AddInt32(&uploadFailedCount, 1)
+						atomic.AddInt32(&uploadCount, -1)
+						fmt.Printf("upload resp: %v\n", resp)
+						if resp.StatusCode != http.StatusServiceUnavailable {
 							fmt.Printf("Upload status %s: resp: %+v\n", resp.Status, resp)
 							if resp.Body != nil {
 								body, _ := ioutil.ReadAll(resp.Body)
@@ -306,6 +302,7 @@ func main() {
 							}
 						}
 					}
+					time.Sleep(time.Second * 1)
 				}
 				uploadFinish = time.Now()
 				wg.Done()
@@ -313,6 +310,9 @@ func main() {
 		}
 		wg.Wait()
 		uploadTime := uploadFinish.Sub(starttime).Seconds()
+		totalUploadTime += uploadTime
+		totalUploadCount += uploadCount
+		totalUploadFailedCount += totalUploadFailedCount
 		bps := float64(uint64(uploadCount)*objectSize) / uploadTime
 		logit(fmt.Sprintf("%4d\t%6s\t%9d\t%10.1f\t%10sB\t%6.1f\t%7d",
 			loop, http.MethodPut, uploadCount, uploadTime, bytefmt.ByteSize(uint64(bps)), float64(uploadCount)/uploadTime, uploadFailedCount))
@@ -328,17 +328,19 @@ func main() {
 					objnum := rand.Int31n(uploadCount) + 1
 					prefix := fmt.Sprintf("%s/%s/k_%s_%d", endpoint, bucket, hostname, objnum)
 					req, _ := http.NewRequest(http.MethodGet, prefix, nil)
-					setSignature(req)
+					setSignature(accessKey, secretKey, req)
 					if resp, err := httpClient.Do(req); err != nil {
 						log.Fatalf("FATAL: Error downloading object %s: %v", prefix, err)
-					} else if resp != nil && resp.Body != nil {
-						if resp.StatusCode == http.StatusServiceUnavailable {
-							atomic.AddInt32(&downloadFailedCount, 1)
-							atomic.AddInt32(&downloadCount, -1)
-						} else {
-							io.Copy(ioutil.Discard, resp.Body)
+					} else if resp.StatusCode == http.StatusOK {
+						io.Copy(ioutil.Discard, resp.Body)
+					} else {
+						atomic.AddInt32(&downloadCount, -1)
+						atomic.AddInt32(&downloadFailedCount, 1)
+						if resp.StatusCode != http.StatusServiceUnavailable {
+							fmt.Printf("Upload status %s: resp: %+v\n", resp.Status, resp)
 						}
 					}
+					time.Sleep(time.Second * 1)
 				}
 				downloadFinish = time.Now()
 				wg.Done()
@@ -346,6 +348,9 @@ func main() {
 		}
 		wg.Wait()
 		downloadTime := downloadFinish.Sub(starttime).Seconds()
+		totalDownloadTime += downloadTime
+		totalDownloadCount += downloadCount
+		totalDownloadFailedCount += totalDownloadFailedCount
 		bps = float64(uint64(downloadCount)*objectSize) / downloadTime
 		logit(fmt.Sprintf("%4d\t%6s\t%9d\t%10.1f\t%10sB\t%6.1f\t%7d",
 			loop, http.MethodGet, downloadCount, downloadTime, bytefmt.ByteSize(uint64(bps)), float64(downloadCount)/downloadTime, downloadFailedCount))
@@ -363,12 +368,17 @@ func main() {
 					}
 					prefix := fmt.Sprintf("%s/%s/k_%s_%d", endpoint, bucket, hostname, objnum)
 					req, _ := http.NewRequest(http.MethodDelete, prefix, nil)
-					setSignature(req)
+					setSignature(accessKey, secretKey, req)
 					if resp, err := httpClient.Do(req); err != nil {
 						log.Fatalf("FATAL: Error deleting object %s: %v", prefix, err)
-					} else if resp != nil && resp.StatusCode == http.StatusServiceUnavailable {
+					} else if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+						// OK
+					} else {
 						atomic.AddInt32(&deleteFailedCount, 1)
 						atomic.AddInt32(&deleteCount, -1)
+						if resp.StatusCode != http.StatusServiceUnavailable {
+							fmt.Printf("delete resp: %v\n", resp)
+						}
 					}
 				}
 				deleteFinish = time.Now()
@@ -377,9 +387,22 @@ func main() {
 		}
 		wg.Wait()
 		deleteTime := deleteFinish.Sub(starttime).Seconds()
+		totalDeleteTime += deleteTime
+		totalDeleteCount += deleteCount
+		totalDeleteFailedCount += deleteFailedCount
 		logit(fmt.Sprintf("%4d\t%6s\t%9d\t%10.1f\t%11s\t%6.1f\t%7d",
-			loop, http.MethodDelete, deleteCount, deleteTime, "NaN", float64(uploadCount)/deleteTime, deleteFailedCount))
+			loop, http.MethodDelete, deleteCount, deleteTime, "--", float64(uploadCount)/deleteTime, deleteFailedCount))
 	}
+	if loops > 1 {
+		bps := float64(uint64(totalUploadCount)*objectSize) / totalUploadTime
+		logit(fmt.Sprintf("%4s\t%6s\t%9d\t%10.1f\t%10sB\t%6.1f\t%7d", "AVG", http.MethodPut, totalUploadCount,
+			totalUploadTime, bytefmt.ByteSize(uint64(bps)), float64(totalUploadCount)/totalUploadTime, totalUploadFailedCount))
 
-	fmt.Println("Benchmark completed.")
+		bps = float64(uint64(totalDownloadCount)*objectSize) / totalDownloadTime
+		logit(fmt.Sprintf("%4s\t%6s\t%9d\t%10.1f\t%10sB\t%6.1f\t%7d", "AVG", http.MethodGet, totalDownloadCount,
+			totalDownloadTime, bytefmt.ByteSize(uint64(bps)), float64(totalDownloadCount)/totalDownloadTime, totalDownloadFailedCount))
+
+		logit(fmt.Sprintf("%4s\t%6s\t%9d\t%10.1f\t%11s\t%6.1f\t%7d", "AVG", http.MethodDelete, totalDeleteCount,
+			totalDeleteTime, "--", float64(totalDeleteCount)/totalDeleteTime, totalDeleteFailedCount))
+	}
 }
