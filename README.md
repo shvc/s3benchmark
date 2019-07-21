@@ -26,20 +26,25 @@ Usage of ./s3benchmark:
 ```        
 
 # Example Benchmark
-Below is an example run of the benchmark for 10 threads with the default 128K object size.  The benchmark reports
-for each operation PUT, GET and DELETE the results in terms of data speed and operations per second.  The program
-writes all results to the log file s3benchmark.log.
-
+Below is an example run of the benchmark for 320 threads with the 128K object size.
+The benchmark reports for each operation PUT, GET and DELETE the results in terms of data speed and operations per second.
+The program writes all results to the log file s3benchmark.log.
 ```
-./s3benchmark -t 10 -l 2
-s3benchmark v1.1.22-072015
-url=http://192.168.55.2:9020, bucket=s3benchmark-test, region=cn-north-1, duration=60, threads=10, loops=2, size=128K(131072)
+./s3benchmark -e http://172.16.3.55:9020 -t 320 -l 3
+s3benchmark vpn201 v1.1.5-072116
+url=http://172.16.3.55:9020, bucket=s3benchmark-test, region=cn-north-1, duration=60, threads=320, loops=3, size=128K(131072)
+2019/07/21 16:30:42 WARNING: Bucket:s3benchmark-test already exists
 Loop	Method	  Objects	Elapsed(s)	 Throuphput	   TPS	 Failed
-   1	   PUT	    14341	      60.1	     29.9MB	 238.8	      0
-   1	   GET	    34581	      60.0	       72MB	 576.3	      0
-   1	DELETE	    14351	       5.7	        NaN	2509.2	      0
-   2	   PUT	    12164	      60.1	     25.3MB	 202.3	      0
-   2	   GET	    31982	      60.0	     66.6MB	 533.0	      0
-   2	DELETE	    12174	       5.2	        NaN	2338.8	      0
-Benchmark completed.
+   1	   PUT	    10506	      61.2	     21.4MB	 171.5	      0
+   1	   GET	    19173	      61.0	     39.3MB	 314.3	      0
+   1	DELETE	    10826	       4.9	         --	2154.3	      0
+   2	   PUT	     9389	      61.0	     19.2MB	 153.8	      0
+   2	   GET	    19200	      60.8	     39.5MB	 315.7	      0
+   2	DELETE	     9709	       4.7	         --	2017.6	      0
+   3	   PUT	     9779	      60.9	     20.1MB	 160.4	      0
+   3	   GET	    19200	      60.8	     39.5MB	 315.7	      0
+   3	DELETE	    10099	       2.0	         --	4780.9	      0
+ AVG	   PUT	    29674	     183.2	     20.2MB	 161.9	      0
+ AVG	   GET	    57573	     182.6	     39.4MB	 315.2	      0
+ AVG	DELETE	    30634	      11.6	         --	2646.4	      0
 ```
