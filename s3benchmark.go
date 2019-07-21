@@ -74,8 +74,6 @@ var HTTPTransport http.RoundTripper = &http.Transport{
 	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 }
 
-var httpClient = &http.Client{Transport: HTTPTransport}
-
 func getS3Client(accessKey, secretKey, region, endpoint string) *s3.S3 {
 	// Build our config
 	creds := credentials.NewStaticCredentials(accessKey, secretKey, "")
@@ -243,8 +241,6 @@ func main() {
 	}
 	hostname := getHostname()
 	//var objectDataMd5 string
-	var totalUploadCount, totalDownloadCount, totalDeleteCount int32
-	var totalUploadFailedCount, totalDownloadFailedCount, totalDeleteFailedCount int32
 
 	fmt.Printf("s3benchmark %s v%s\n", hostname, version)
 	logit(fmt.Sprintf("url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s(%d)",
@@ -265,8 +261,11 @@ func main() {
 	// Create the Bucket and delete the Objects
 	createBucket(accessKey, secretKey, region, endpoint, bucket)
 	deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, hostname)
-
+	httpClient := &http.Client{Transport: HTTPTransport}
 	var totalUploadTime, totalDownloadTime, totalDeleteTime float64
+	var totalUploadCount, totalDownloadCount, totalDeleteCount int32
+	var totalUploadFailedCount, totalDownloadFailedCount, totalDeleteFailedCount int32
+
 	// Loop running the tests
 	logit("Loop\tMethod\t  Objects\tElapsed(s)\t Throuphput\t   TPS\t Failed")
 	for loop := 1; loop <= loops; loop++ {
