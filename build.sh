@@ -1,7 +1,7 @@
 #!/bin/sh
 # Sat Jul 16 22:15:04 CST 2019
 #
-version="1.1.$(git rev-list HEAD --count)-$(date +'%m%d%H')"
+version="2.1.$(git rev-list HEAD --count)-$(date +'%m%d%H')"
 if [ "X$1" = "Xpkg" ]
 then
   which zip || { echo 'zip command not find'; exit; }
