@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"testing"
 )
 
@@ -15,5 +16,18 @@ func Test_hmacSHA1(t *testing.T) {
 		if to != result {
 			t.Errorf("expect: %s, but got: %s", result, to)
 		}
+	}
+}
+
+func Test_canonicalAmzHeaders(t *testing.T) {
+	expect := "x-amz-a:content-a\nx-amz-b:content-b\nx-amz-c:content-c\n"
+	req, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1/bucket/key", nil)
+	req.Header.Set("X-Amz-c", "content-c")
+	req.Header.Set("X-Xmz-D", "content-d")
+	req.Header.Set("X-Amz-A", "content-a")
+	req.Header.Set("X-Amz-B", "content-b")
+	result := canonicalAmzHeaders(req)
+	if result != expect {
+		t.Errorf("expect %s, but got %s", expect, result)
 	}
 }

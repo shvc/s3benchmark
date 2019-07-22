@@ -35,19 +35,9 @@ import (
 )
 
 // version
-var version = "1.1.1"
+var version = "2.1.1"
 
 // TODO: avoid different threads download the same object
-
-// Global variables
-var accessKey, secretKey, endpoint, bucket, region string
-var durationSecs, threads, loops int
-var objectSize uint64
-var objectData []byte
-
-//var objectDataMd5 string
-var runningThreads, uploadCount, downloadCount, deleteCount, uploadFailedCount, downloadFailedCount, deleteFailedCount int32
-var endtime, uploadFinish, downloadFinish, deleteFinish time.Time
 
 func logit(msg string) {
 	fmt.Println(msg)
@@ -84,9 +74,7 @@ var HTTPTransport http.RoundTripper = &http.Transport{
 	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 }
 
-var httpClient = &http.Client{Transport: HTTPTransport}
-
-func getS3Client() *s3.S3 {
+func getS3Client(accessKey, secretKey, region, endpoint string) *s3.S3 {
 	// Build our config
 	creds := credentials.NewStaticCredentials(accessKey, secretKey, "")
 	loglevel := aws.LogOff
@@ -109,9 +97,9 @@ func getS3Client() *s3.S3 {
 	return client
 }
 
-func createBucket() {
+func createBucket(accessKey, secretKey, region, endpoint, bucket string) {
 	// Get a client
-	client := getS3Client()
+	client := getS3Client(accessKey, secretKey, region, endpoint)
 	// Create our bucket (may already exist without error)
 	in := &s3.CreateBucketInput{Bucket: aws.String(bucket)}
 	if _, err := client.CreateBucket(in); err != nil {
@@ -128,19 +116,19 @@ func createBucket() {
 	}
 }
 
-func deleteAllObjects() {
+func deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, prefix string) {
 	// Get a client
-	client := getS3Client()
+	client := getS3Client(accessKey, secretKey, region, endpoint)
 	// Use multiple routines to do the actual delete
-	var doneDeletes sync.WaitGroup
-	// Loop deleting reading as big a list as we can
+	var wg sync.WaitGroup
 	var keyMarker *string
 	var err error
 	for loop := 1; ; loop++ {
-		// Delete all the existing objects and versions in the bucket
+		// Delete all the existing objects in the bucket
 		in := &s3.ListObjectsInput{
 			Bucket:  aws.String(bucket),
 			Marker:  keyMarker,
+			Prefix:  aws.String(prefix),
 			MaxKeys: aws.Int64(1000),
 		}
 		if listObjects, listErr := client.ListObjects(in); listErr == nil {
@@ -149,17 +137,17 @@ func deleteAllObjects() {
 				delete.Objects = append(delete.Objects, &s3.ObjectIdentifier{Key: obj.Key})
 			}
 			if len(delete.Objects) > 0 {
-				// Start a delete routine
-				doDelete := func(bucket string, delete *s3.Delete) {
-					if _, e := client.DeleteObjects(&s3.DeleteObjectsInput{Bucket: aws.String(bucket), Delete: delete}); e != nil {
+				wg.Add(1)
+				go func(bucket string, delete *s3.Delete) {
+					if _, e := client.DeleteObjects(&s3.DeleteObjectsInput{
+						Bucket: aws.String(bucket),
+						Delete: delete}); e != nil {
 						err = fmt.Errorf("DeleteObjects unexpected failure: %s", e.Error())
 					}
-					doneDeletes.Done()
-				}
-				doneDeletes.Add(1)
-				go doDelete(bucket, delete)
+					wg.Done()
+				}(bucket, delete)
 			}
-			// Advance to next versions
+			// Advance to next page
 			if listObjects.IsTruncated == nil || !*listObjects.IsTruncated {
 				break
 			}
@@ -169,12 +157,12 @@ func deleteAllObjects() {
 			if strings.HasPrefix(listErr.Error(), "NoSuchBucket") {
 				return
 			}
-			err = fmt.Errorf("ListObjectVersions unexpected failure: %v", listErr)
+			err = fmt.Errorf("ListObjects unexpected failure: %v", listErr)
 			break
 		}
 	}
 	// Wait for deletes to finish
-	doneDeletes.Wait()
+	wg.Wait()
 	// If error, it is fatal
 	if err != nil {
 		log.Fatalf("FATAL: Unable to delete objects from bucket: %v", err)
@@ -210,7 +198,7 @@ func hmacSHA1(key []byte, content string) []byte {
 	return mac.Sum(nil)
 }
 
-func setSignature(req *http.Request) {
+func setSignature(accessKey, secretKey string, req *http.Request) {
 	// Setup default parameters
 	dateHdr := time.Now().UTC().Format(time.RFC1123)
 	req.Header.Set("X-Amz-Date", dateHdr)
@@ -224,83 +212,10 @@ func setSignature(req *http.Request) {
 	req.Header.Set("Authorization", fmt.Sprintf("AWS %s:%s", accessKey, signature))
 }
 
-func runUpload(threadNum int) {
-	for time.Now().Before(endtime) {
-		objnum := atomic.AddInt32(&uploadCount, 1)
-		fileobj := bytes.NewReader(objectData)
-		prefix := fmt.Sprintf("%s/%s/Object-%d", endpoint, bucket, objnum)
-		req, _ := http.NewRequest(http.MethodPut, prefix, fileobj)
-		req.Header.Set("Content-Length", strconv.FormatUint(objectSize, 10))
-		//req.Header.Set("Content-MD5", objectDataMd5)
-		setSignature(req)
-		if resp, err := httpClient.Do(req); err != nil {
-			log.Fatalf("FATAL: Error uploading object %s: %v", prefix, err)
-		} else if resp != nil && resp.StatusCode != http.StatusOK {
-			if resp.StatusCode == http.StatusServiceUnavailable {
-				atomic.AddInt32(&uploadFailedCount, 1)
-				atomic.AddInt32(&uploadCount, -1)
-			} else {
-				fmt.Printf("Upload status %s: resp: %+v\n", resp.Status, resp)
-				if resp.Body != nil {
-					body, _ := ioutil.ReadAll(resp.Body)
-					fmt.Printf("Body: %s\n", string(body))
-				}
-			}
-		}
-	}
-	// Remember last done time
-	uploadFinish = time.Now()
-	// One less thread
-	atomic.AddInt32(&runningThreads, -1)
-}
-
-func runDownload(threadNum int) {
-	for time.Now().Before(endtime) {
-		atomic.AddInt32(&downloadCount, 1)
-		objnum := rand.Int31n(uploadCount) + 1
-		prefix := fmt.Sprintf("%s/%s/Object-%d", endpoint, bucket, objnum)
-		req, _ := http.NewRequest(http.MethodGet, prefix, nil)
-		setSignature(req)
-		if resp, err := httpClient.Do(req); err != nil {
-			log.Fatalf("FATAL: Error downloading object %s: %v", prefix, err)
-		} else if resp != nil && resp.Body != nil {
-			if resp.StatusCode == http.StatusServiceUnavailable {
-				atomic.AddInt32(&downloadFailedCount, 1)
-				atomic.AddInt32(&downloadCount, -1)
-			} else {
-				io.Copy(ioutil.Discard, resp.Body)
-			}
-		}
-	}
-	// Remember last done time
-	downloadFinish = time.Now()
-	// One less thread
-	atomic.AddInt32(&runningThreads, -1)
-}
-
-func runDelete(threadNum int) {
-	for {
-		objnum := atomic.AddInt32(&deleteCount, 1)
-		if objnum > uploadCount {
-			break
-		}
-		prefix := fmt.Sprintf("%s/%s/Object-%d", endpoint, bucket, objnum)
-		req, _ := http.NewRequest(http.MethodDelete, prefix, nil)
-		setSignature(req)
-		if resp, err := httpClient.Do(req); err != nil {
-			log.Fatalf("FATAL: Error deleting object %s: %v", prefix, err)
-		} else if resp != nil && resp.StatusCode == http.StatusServiceUnavailable {
-			atomic.AddInt32(&deleteFailedCount, 1)
-			atomic.AddInt32(&deleteCount, -1)
-		}
-	}
-	// Remember last done time
-	deleteFinish = time.Now()
-	// One less thread
-	atomic.AddInt32(&runningThreads, -1)
-}
-
 func main() {
+	var accessKey, secretKey, endpoint, bucket, region string
+	var durationSecs, threads, loops int
+
 	flag.StringVar(&accessKey, "a", "object_user1", "Access key")
 	flag.StringVar(&secretKey, "s", "ChangeMeChangeMeChangeMeChangeMeChangeMe", "Secret key")
 	flag.StringVar(&endpoint, "e", "http://192.168.55.2:9020", "S3 Endpoint URL")
@@ -319,17 +234,20 @@ func main() {
 	if secretKey == "" {
 		log.Fatal("Missing argument -s for secret key.")
 	}
-	var err error
-	if objectSize, err = bytefmt.ToBytes(*sizeArg); err != nil {
+
+	objectSize, err := bytefmt.ToBytes(*sizeArg)
+	if err != nil {
 		log.Fatalf("Invalid -z argument for object size: %v", err)
 	}
+	hostname := getHostname()
+	//var objectDataMd5 string
 
-	fmt.Printf("s3benchmark v%s\n", version)
+	fmt.Printf("s3benchmark %s v%s\n", hostname, version)
 	logit(fmt.Sprintf("url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s(%d)",
 		endpoint, bucket, region, durationSecs, threads, loops, *sizeArg, objectSize))
 
 	// Initialize data
-	objectData = make([]byte, objectSize)
+	objectData := make([]byte, objectSize)
 	if n, e := rand.Read(objectData); e != nil {
 		log.Fatalf("generate random data failed: %s", e)
 	} else if uint64(n) < objectSize {
@@ -340,67 +258,150 @@ func main() {
 	//hasher.Write(objectData)
 	//objectDataMd5 = base64.StdEncoding.EncodeToString(hasher.Sum(nil))
 
-	// Create the bucket and delete all the objects
-	createBucket()
-	deleteAllObjects()
+	// Create the Bucket and delete the Objects
+	createBucket(accessKey, secretKey, region, endpoint, bucket)
+	deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, hostname)
+	httpClient := &http.Client{Transport: HTTPTransport}
+	var totalUploadTime, totalDownloadTime, totalDeleteTime float64
+	var totalUploadCount, totalDownloadCount, totalDeleteCount int32
+	var totalUploadFailedCount, totalDownloadFailedCount, totalDeleteFailedCount int32
 
 	// Loop running the tests
 	logit("Loop\tMethod\t  Objects\tElapsed(s)\t Throuphput\t   TPS\t Failed")
 	for loop := 1; loop <= loops; loop++ {
-		// reset counters
-		uploadCount = 0
-		uploadFailedCount = 0
-		downloadCount = 0
-		downloadFailedCount = 0
-		deleteCount = 0
-		deleteFailedCount = 0
-		runningThreads = int32(threads)
+		var uploadCount, uploadFailedCount int32
+		var downloadCount, downloadFailedCount int32
+		var deleteCount, deleteFailedCount int32
+		var uploadFinish, downloadFinish, deleteFinish time.Time
 		starttime := time.Now()
-		endtime = starttime.Add(time.Second * time.Duration(durationSecs))
+		endtime := starttime.Add(time.Second * time.Duration(durationSecs))
+		wg := sync.WaitGroup{}
 		for n := 1; n <= threads; n++ {
-			go runUpload(n)
+			wg.Add(1)
+			go func() {
+				for time.Now().Before(endtime) {
+					objnum := atomic.AddInt32(&uploadCount, 1)
+					fileobj := bytes.NewReader(objectData)
+					prefix := fmt.Sprintf("%s/%s/k_%s_%d", endpoint, bucket, hostname, objnum)
+					req, _ := http.NewRequest(http.MethodPut, prefix, fileobj)
+					req.Header.Set("Content-Length", strconv.FormatUint(objectSize, 10))
+					//req.Header.Set("Content-MD5", objectDataMd5)
+					setSignature(accessKey, secretKey, req)
+					if resp, err := httpClient.Do(req); err != nil {
+						log.Fatalf("FATAL: Error uploading object %s: %v", prefix, err)
+					} else if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+						atomic.AddInt32(&uploadFailedCount, 1)
+						atomic.AddInt32(&uploadCount, -1)
+						fmt.Printf("upload resp: %v\n", resp)
+						if resp.StatusCode != http.StatusServiceUnavailable {
+							fmt.Printf("Upload status %s: resp: %+v\n", resp.Status, resp)
+							if resp.Body != nil {
+								body, _ := ioutil.ReadAll(resp.Body)
+								fmt.Printf("Body: %s\n", string(body))
+							}
+						}
+					}
+					time.Sleep(time.Second * 1)
+				}
+				uploadFinish = time.Now()
+				wg.Done()
+			}()
 		}
-		// Wait for it to finish
-		for atomic.LoadInt32(&runningThreads) > 0 {
-			time.Sleep(time.Millisecond)
-		}
+		wg.Wait()
 		uploadTime := uploadFinish.Sub(starttime).Seconds()
+		totalUploadTime += uploadTime
+		totalUploadCount += uploadCount
+		totalUploadFailedCount += totalUploadFailedCount
 		bps := float64(uint64(uploadCount)*objectSize) / uploadTime
 		logit(fmt.Sprintf("%4d\t%6s\t%9d\t%10.1f\t%10sB\t%6.1f\t%7d",
 			loop, http.MethodPut, uploadCount, uploadTime, bytefmt.ByteSize(uint64(bps)), float64(uploadCount)/uploadTime, uploadFailedCount))
 
 		// Run the download case
-		runningThreads = int32(threads)
 		starttime = time.Now()
 		endtime = starttime.Add(time.Second * time.Duration(durationSecs))
 		for n := 1; n <= threads; n++ {
-			go runDownload(n)
+			wg.Add(1)
+			go func() {
+				for time.Now().Before(endtime) {
+					atomic.AddInt32(&downloadCount, 1)
+					objnum := rand.Int31n(uploadCount) + 1
+					prefix := fmt.Sprintf("%s/%s/k_%s_%d", endpoint, bucket, hostname, objnum)
+					req, _ := http.NewRequest(http.MethodGet, prefix, nil)
+					setSignature(accessKey, secretKey, req)
+					if resp, err := httpClient.Do(req); err != nil {
+						log.Fatalf("FATAL: Error downloading object %s: %v", prefix, err)
+					} else if resp.StatusCode == http.StatusOK {
+						io.Copy(ioutil.Discard, resp.Body)
+					} else {
+						atomic.AddInt32(&downloadCount, -1)
+						atomic.AddInt32(&downloadFailedCount, 1)
+						if resp.StatusCode != http.StatusServiceUnavailable {
+							fmt.Printf("Upload status %s: resp: %+v\n", resp.Status, resp)
+						}
+					}
+					time.Sleep(time.Second * 1)
+				}
+				downloadFinish = time.Now()
+				wg.Done()
+			}()
 		}
-		// Wait for it to finish
-		for atomic.LoadInt32(&runningThreads) > 0 {
-			time.Sleep(time.Millisecond)
-		}
+		wg.Wait()
 		downloadTime := downloadFinish.Sub(starttime).Seconds()
+		totalDownloadTime += downloadTime
+		totalDownloadCount += downloadCount
+		totalDownloadFailedCount += totalDownloadFailedCount
 		bps = float64(uint64(downloadCount)*objectSize) / downloadTime
 		logit(fmt.Sprintf("%4d\t%6s\t%9d\t%10.1f\t%10sB\t%6.1f\t%7d",
 			loop, http.MethodGet, downloadCount, downloadTime, bytefmt.ByteSize(uint64(bps)), float64(downloadCount)/downloadTime, downloadFailedCount))
 
 		// Run the delete case
-		runningThreads = int32(threads)
 		starttime = time.Now()
 		endtime = starttime.Add(time.Second * time.Duration(durationSecs))
 		for n := 1; n <= threads; n++ {
-			go runDelete(n)
+			wg.Add(1)
+			go func() {
+				for {
+					objnum := atomic.AddInt32(&deleteCount, 1)
+					if objnum > uploadCount {
+						break
+					}
+					prefix := fmt.Sprintf("%s/%s/k_%s_%d", endpoint, bucket, hostname, objnum)
+					req, _ := http.NewRequest(http.MethodDelete, prefix, nil)
+					setSignature(accessKey, secretKey, req)
+					if resp, err := httpClient.Do(req); err != nil {
+						log.Fatalf("FATAL: Error deleting object %s: %v", prefix, err)
+					} else if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+						// OK
+					} else {
+						atomic.AddInt32(&deleteFailedCount, 1)
+						atomic.AddInt32(&deleteCount, -1)
+						if resp.StatusCode != http.StatusServiceUnavailable {
+							fmt.Printf("delete resp: %v\n", resp)
+						}
+					}
+				}
+				deleteFinish = time.Now()
+				wg.Done()
+			}()
 		}
-		// Wait for it to finish
-		for atomic.LoadInt32(&runningThreads) > 0 {
-			time.Sleep(time.Millisecond)
-		}
+		wg.Wait()
 		deleteTime := deleteFinish.Sub(starttime).Seconds()
+		totalDeleteTime += deleteTime
+		totalDeleteCount += deleteCount
+		totalDeleteFailedCount += deleteFailedCount
 		logit(fmt.Sprintf("%4d\t%6s\t%9d\t%10.1f\t%11s\t%6.1f\t%7d",
-			loop, http.MethodDelete, deleteCount, deleteTime, "NaN", float64(uploadCount)/deleteTime, deleteFailedCount))
+			loop, http.MethodDelete, deleteCount, deleteTime, "--", float64(uploadCount)/deleteTime, deleteFailedCount))
 	}
+	if loops > 1 {
+		bps := float64(uint64(totalUploadCount)*objectSize) / totalUploadTime
+		logit(fmt.Sprintf("%4s\t%6s\t%9d\t%10.1f\t%10sB\t%6.1f\t%7d", "AVG", http.MethodPut, totalUploadCount,
+			totalUploadTime, bytefmt.ByteSize(uint64(bps)), float64(totalUploadCount)/totalUploadTime, totalUploadFailedCount))
 
-	// All done
-	fmt.Println("Benchmark completed.")
+		bps = float64(uint64(totalDownloadCount)*objectSize) / totalDownloadTime
+		logit(fmt.Sprintf("%4s\t%6s\t%9d\t%10.1f\t%10sB\t%6.1f\t%7d", "AVG", http.MethodGet, totalDownloadCount,
+			totalDownloadTime, bytefmt.ByteSize(uint64(bps)), float64(totalDownloadCount)/totalDownloadTime, totalDownloadFailedCount))
+
+		logit(fmt.Sprintf("%4s\t%6s\t%9d\t%10.1f\t%11s\t%6.1f\t%7d", "AVG", http.MethodDelete, totalDeleteCount,
+			totalDeleteTime, "--", float64(totalDeleteCount)/totalDeleteTime, totalDeleteFailedCount))
+	}
 }
