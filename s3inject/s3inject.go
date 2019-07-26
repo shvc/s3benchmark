@@ -310,8 +310,8 @@ func main() {
 	wg.Wait()
 	uploadFinish = time.Now()
 	uploadTime := uploadFinish.Sub(starttime).Seconds()
-	bps := float64(uint64(uploadCount)*objectSize) / uploadTime
+	bps := float64(uint64(number)*objectSize) / uploadTime
 	logit(fmt.Sprintf("%10d\t%10.1f\t%10sB\t%6.1f\t%7d",
-		uploadCount, uploadTime, bytefmt.ByteSize(uint64(bps)), float64(uploadCount)/uploadTime, uploadFailedCount))
+		number, uploadTime, bytefmt.ByteSize(uint64(bps)), float64(number)/uploadTime, uploadFailedCount))
 
 }
