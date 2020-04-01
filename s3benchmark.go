@@ -39,6 +39,24 @@ var version = "2.1.1"
 
 // TODO: avoid different threads download the same object
 
+// transport represent Our HTTP transport used for the roundtripper below
+var transport http.RoundTripper = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	Dial: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).Dial,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 0,
+	// Allow an unlimited number of idle connections
+	MaxIdleConnsPerHost: 4096,
+	MaxIdleConns:        0,
+	// But limit their idle time
+	IdleConnTimeout: time.Minute,
+	// Ignore TLS errors
+	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+}
+
 func logit(msg string) {
 	fmt.Println(msg)
 	logfile, _ := os.OpenFile("s3benchmark.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
@@ -56,29 +74,10 @@ func getHostname() string {
 	return hostname
 }
 
-// HTTPTransport represent Our HTTP transport used for the roundtripper below
-var HTTPTransport http.RoundTripper = &http.Transport{
-	Proxy: http.ProxyFromEnvironment,
-	Dial: (&net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).Dial,
-	TLSHandshakeTimeout:   10 * time.Second,
-	ExpectContinueTimeout: 0,
-	// Allow an unlimited number of idle connections
-	MaxIdleConnsPerHost: 4096,
-	MaxIdleConns:        0,
-	// But limit their idle time
-	IdleConnTimeout: time.Minute,
-	// Ignore TLS errors
-	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-}
-
 func getS3Client(accessKey, secretKey, region, endpoint string) *s3.S3 {
-	// Build our config
 	creds := credentials.NewStaticCredentials(accessKey, secretKey, "")
 	loglevel := aws.LogOff
-	// Build the rest of the configuration
+
 	awsConfig := &aws.Config{
 		Region:               aws.String(region),
 		Endpoint:             aws.String(endpoint),
@@ -86,8 +85,9 @@ func getS3Client(accessKey, secretKey, region, endpoint string) *s3.S3 {
 		LogLevel:             &loglevel,
 		S3ForcePathStyle:     aws.Bool(true),
 		S3Disable100Continue: aws.Bool(true),
-		// Comment following to use default transport
-		HTTPClient: &http.Client{Transport: HTTPTransport},
+		HTTPClient: &http.Client{
+			Transport: transport,
+		},
 	}
 	session := session.New(awsConfig)
 	client := s3.New(session)
@@ -98,10 +98,11 @@ func getS3Client(accessKey, secretKey, region, endpoint string) *s3.S3 {
 }
 
 func createBucket(accessKey, secretKey, region, endpoint, bucket string) {
-	// Get a client
 	client := getS3Client(accessKey, secretKey, region, endpoint)
 	// Create our bucket (may already exist without error)
-	in := &s3.CreateBucketInput{Bucket: aws.String(bucket)}
+	in := &s3.CreateBucketInput{
+		Bucket: aws.String(bucket),
+	}
 	if _, err := client.CreateBucket(in); err != nil {
 		if awsErr, ok := err.(awserr.Error); ok {
 			switch awsErr.Code() {
@@ -117,7 +118,6 @@ func createBucket(accessKey, secretKey, region, endpoint, bucket string) {
 }
 
 func deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, prefix string) {
-	// Get a client
 	client := getS3Client(accessKey, secretKey, region, endpoint)
 	// Use multiple routines to do the actual delete
 	var wg sync.WaitGroup
@@ -205,8 +205,7 @@ func setSignature(accessKey, secretKey string, req *http.Request) {
 	// Get the canonical resource and header
 	canonicalResource := req.URL.EscapedPath()
 	canonicalHeaders := canonicalAmzHeaders(req)
-	stringToSign := req.Method + "\n" + req.Header.Get("Content-MD5") + "\n" + req.Header.Get("Content-Type") + "\n\n" +
-		canonicalHeaders + canonicalResource
+	stringToSign := req.Method + "\n" + req.Header.Get("Content-MD5") + "\n" + req.Header.Get("Content-Type") + "\n\n" + canonicalHeaders + canonicalResource
 	hash := hmacSHA1([]byte(secretKey), stringToSign)
 	signature := base64.StdEncoding.EncodeToString(hash)
 	req.Header.Set("Authorization", fmt.Sprintf("AWS %s:%s", accessKey, signature))
@@ -240,7 +239,6 @@ func main() {
 		log.Fatalf("Invalid -z argument for object size: %v", err)
 	}
 	hostname := getHostname()
-	//var objectDataMd5 string
 
 	fmt.Printf("s3benchmark %s v%s\n", hostname, version)
 	logit(fmt.Sprintf("url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s(%d)",
@@ -251,17 +249,17 @@ func main() {
 	if n, e := rand.Read(objectData); e != nil {
 		log.Fatalf("generate random data failed: %s", e)
 	} else if uint64(n) < objectSize {
-		log.Fatalf("invalid randome data size, got %d, expect %d", n, objectSize)
+		log.Fatalf("invalid random data size, got %d, expect %d", n, objectSize)
 	}
 
 	//hasher := md5.New()
 	//hasher.Write(objectData)
-	//objectDataMd5 = base64.StdEncoding.EncodeToString(hasher.Sum(nil))
+	//objectDataMd5 := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
 
 	// Create the Bucket and delete the Objects
 	createBucket(accessKey, secretKey, region, endpoint, bucket)
 	deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, hostname)
-	httpClient := &http.Client{Transport: HTTPTransport}
+	httpClient := &http.Client{Transport: transport}
 	var totalUploadTime, totalDownloadTime, totalDeleteTime float64
 	var totalUploadCount, totalDownloadCount, totalDeleteCount int32
 	var totalUploadFailedCount, totalDownloadFailedCount, totalDeleteFailedCount int32
