@@ -50,7 +50,7 @@ var transport http.RoundTripper = &http.Transport{
 	ExpectContinueTimeout: 0,
 	// Allow an unlimited number of idle connections
 	MaxIdleConnsPerHost: 4096,
-	MaxIdleConns:        0,
+	MaxIdleConns:        0, // MaxIdleConns controls the maximum number of idle (keep-alive) connections across all hosts. Zero means no limit.
 	// But limit their idle time
 	IdleConnTimeout: time.Minute,
 	// Ignore TLS errors

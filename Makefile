@@ -1,39 +1,51 @@
-BINARY=s3benchmark
+APP?=s3benchmark
 BUILDDATE=$(shell date +'%Y-%m-%dT%H:%M:%SZ')
-VERSION=2.1.$(shell git rev-list HEAD --count)
+VERSION=2.1.$(shell git rev-parse --short HEAD)
 LONGVER=${VERSION}@${BUILDDATE}
 
 LDFLAGS=-ldflags "-X main.version=${LONGVER}"
 
 .DEFAULT_GOAL:=default
-pkg:
-	@echo "Building Linux amd64 ${BINARY}-${VERSION}"
-	GOOS=linux GOARCH=amd64 go build ${LDFLAGS}
-	zip -m ${BINARY}-${VERSION}-linux.zip ${BINARY}
-	
-	@echo "Building Macos amd64 ${BINARY}-${VERSION}"
-	GOOS=darwin GOARCH=amd64 go build ${LDFLAGS}
-	zip -m ${BINARY}-${VERSION}-macos.zip ${BINARY}
-	
-	@echo "Building Windows amd64 ${BINARY}-${VERSION}"
-	GOOS=windows GOARCH=amd64 go build ${LDFLAGS}
-	zip -m ${BINARY}-${VERSION}-win.zip ${BINARY}.exe
 
+## pkg: build and package the app
+.PHONY: pkg
+pkg:
+	@echo "Building Linux amd64 ${APP}-${VERSION}"
+	GOOS=linux GOARCH=amd64 go build ${LDFLAGS}
+	zip -m ${APP}-${VERSION}-linux.zip ${APP}
+	
+	@echo "Building Macos amd64 ${APP}-${VERSION}"
+	GOOS=darwin GOARCH=amd64 go build ${LDFLAGS}
+	zip -m ${APP}-${VERSION}-macos.zip ${APP}
+	
+	@echo "Building Windows amd64 ${APP}-${VERSION}"
+	GOOS=windows GOARCH=amd64 go build ${LDFLAGS}
+	zip -m ${APP}-${VERSION}-win.zip ${APP}.exe
+
+## test: runs go test with default values
+.PHONY: test
 test:
 	go test ./...
 
+## vet: runs go vet
+.PHONY: vet
 vet:
 	go vet ./...
 
+## default: build the app
+.PHONY: default
 default:
-	@echo "Building ${BINARY}-${VERSION}"
+	@echo "Building ${APP}-${VERSION}"
 	go build ${LDFLAGS}
 
-install: default
-	install ${BINARY} /usr/local/bin/
-
+## clean: cleans the build results
+.PHONY: clean
 clean:
-	rm -rf *zip
-	rm -rf ${BINARY}
+	rm -rf *zip ${APP}
 
-.PHONY: pkg test vet default clean
+## help: prints this help message
+.PHONY: help
+help:
+	@echo "Usage: \n"
+	@sed -n 's/^##//p' ${MAKEFILE_LIST} | column -t -s ':' |  sed -e 's/^/ /'
+
