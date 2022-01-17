@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/tls"
@@ -25,18 +26,29 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/bytefmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // version
 var version = "2.1.1"
 
-// TODO: avoid different threads download the same object
+var transport http.RoundTripper = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	Dial: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).Dial,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 0,
+	MaxIdleConnsPerHost:   4096,
+	MaxIdleConns:          0,
+	IdleConnTimeout:       time.Minute,
+	TLSClientConfig: &tls.Config{
+		InsecureSkipVerify: true,
+	},
+}
 
 func logit(msg string) {
 	fmt.Println(msg)
@@ -73,26 +85,32 @@ var HTTPTransport http.RoundTripper = &http.Transport{
 	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 }
 
-func getS3Client(accessKey, secretKey, region, endpoint string) *s3.S3 {
-	// Build our config
-	creds := credentials.NewStaticCredentials(accessKey, secretKey, "")
-	loglevel := aws.LogOff
-	// Build the rest of the configuration
-	awsConfig := &aws.Config{
-		Region:               aws.String(region),
-		Endpoint:             aws.String(endpoint),
-		Credentials:          creds,
-		LogLevel:             &loglevel,
-		S3ForcePathStyle:     aws.Bool(true),
-		S3Disable100Continue: aws.Bool(true),
-		// Comment following to use default transport
-		HTTPClient: &http.Client{Transport: HTTPTransport},
+func getS3Client(accessKey, secretKey, region, endpoint string) *s3.Client {
+	awsConfig := aws.Config{
+		Region:        region,
+		ClientLogMode: 0,
+		HTTPClient: &http.Client{
+			Transport: transport,
+		},
+		Credentials: aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+			return aws.Credentials{
+				AccessKeyID:     accessKey,
+				SecretAccessKey: secretKey,
+			}, nil
+		}),
+		EndpointResolverWithOptions: aws.EndpointResolverWithOptionsFunc(func(service, region string, opts ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:           endpoint,
+				SigningName:   "s3",
+				SigningRegion: region,
+			}, nil
+		}),
 	}
-	session := session.New(awsConfig)
-	client := s3.New(session)
-	if client == nil {
-		log.Fatalf("FATAL: Unable to create new client.")
-	}
+
+	client := s3.NewFromConfig(awsConfig, func(opts *s3.Options) {
+		opts.UsePathStyle = true
+	})
+
 	return client
 }
 
@@ -101,16 +119,18 @@ func createBucket(accessKey, secretKey, region, endpoint, bucket string) {
 	client := getS3Client(accessKey, secretKey, region, endpoint)
 	// Create our bucket (may already exist without error)
 	in := &s3.CreateBucketInput{Bucket: aws.String(bucket)}
-	if _, err := client.CreateBucket(in); err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			switch awsErr.Code() {
-			case "BucketAlreadyOwnedByYou":
-				fallthrough
-			case "BucketAlreadyExists":
-				log.Printf("WARNING: Bucket:%s already exists", bucket)
-				return
+	if _, err := client.CreateBucket(context.Background(), in); err != nil {
+		/*
+			if awsErr, ok := err.(awserr.Error); ok {
+				switch awsErr.Code() {
+				case "BucketAlreadyOwnedByYou":
+					fallthrough
+				case "BucketAlreadyExists":
+					log.Printf("WARNING: Bucket:%s already exists", bucket)
+					return
+				}
 			}
-		}
+		*/
 		log.Fatalf("FATAL: Unable to create bucket %s (is your access and secret correct?): %v", bucket, err)
 	}
 }
@@ -128,26 +148,27 @@ func deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, prefix str
 			Bucket:  aws.String(bucket),
 			Marker:  keyMarker,
 			Prefix:  aws.String(prefix),
-			MaxKeys: aws.Int64(1000),
+			MaxKeys: 1000,
 		}
-		if listObjects, listErr := client.ListObjects(in); listErr == nil {
-			delete := &s3.Delete{Quiet: aws.Bool(true)}
+		if listObjects, listErr := client.ListObjects(context.Background(), in); listErr == nil {
+			delete := &types.Delete{Quiet: true}
 			for _, obj := range listObjects.Contents {
-				delete.Objects = append(delete.Objects, &s3.ObjectIdentifier{Key: obj.Key})
+				delete.Objects = append(delete.Objects, types.ObjectIdentifier{Key: obj.Key})
 			}
 			if len(delete.Objects) > 0 {
 				wg.Add(1)
-				go func(bucket string, delete *s3.Delete) {
-					if _, e := client.DeleteObjects(&s3.DeleteObjectsInput{
+				go func(bucket string, delete *types.Delete) {
+					if _, e := client.DeleteObjects(context.Background(), &s3.DeleteObjectsInput{
 						Bucket: aws.String(bucket),
-						Delete: delete}); e != nil {
+						Delete: delete,
+					}); e != nil {
 						err = fmt.Errorf("DeleteObjects unexpected failure: %s", e.Error())
 					}
 					wg.Done()
 				}(bucket, delete)
 			}
 			// Advance to next page
-			if listObjects.IsTruncated == nil || !*listObjects.IsTruncated {
+			if listObjects.IsTruncated == false {
 				break
 			}
 			keyMarker = listObjects.NextMarker
@@ -220,7 +241,7 @@ func main() {
 	flag.StringVar(&secretKey, "s", "ChangeMeChangeMeChangeMeChangeMeChangeMe", "Secret key")
 	flag.StringVar(&endpoint, "e", "http://192.168.55.2:9020", "S3 Endpoint URL")
 	flag.StringVar(&bucket, "b", "s3inject-test", "Bucket for testing")
-	flag.StringVar(&region, "r", endpoints.CnNorth1RegionID, "Region for testing")
+	flag.StringVar(&region, "r", "", "Region for testing")
 	flag.Int64Var(&number, "n", 1024, "Number of random file to inject")
 	flag.UintVar(&threads, "t", 16, "Number of threads to run")
 	sizeArg := flag.String("z", "128K", "Size of objects in bytes with postfix K, M, and G")

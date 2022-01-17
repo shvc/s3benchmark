@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/tls"
@@ -26,20 +27,14 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/bytefmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // version
 var version = "2.1.1"
 
-// TODO: avoid different threads download the same object
-
-// transport represent Our HTTP transport used for the roundtripper below
 var transport http.RoundTripper = &http.Transport{
 	Proxy: http.ProxyFromEnvironment,
 	Dial: (&net.Dialer{
@@ -48,13 +43,12 @@ var transport http.RoundTripper = &http.Transport{
 	}).Dial,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 0,
-	// Allow an unlimited number of idle connections
-	MaxIdleConnsPerHost: 4096,
-	MaxIdleConns:        0, // MaxIdleConns controls the maximum number of idle (keep-alive) connections across all hosts. Zero means no limit.
-	// But limit their idle time
-	IdleConnTimeout: time.Minute,
-	// Ignore TLS errors
-	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	MaxIdleConnsPerHost:   4096,
+	MaxIdleConns:          0,
+	IdleConnTimeout:       time.Minute,
+	TLSClientConfig: &tls.Config{
+		InsecureSkipVerify: true,
+	},
 }
 
 func logit(msg string) {
@@ -74,46 +68,46 @@ func getHostname() string {
 	return hostname
 }
 
-func getS3Client(accessKey, secretKey, region, endpoint string) *s3.S3 {
-	creds := credentials.NewStaticCredentials(accessKey, secretKey, "")
-	loglevel := aws.LogOff
-
-	awsConfig := &aws.Config{
-		Region:               aws.String(region),
-		Endpoint:             aws.String(endpoint),
-		Credentials:          creds,
-		LogLevel:             &loglevel,
-		S3ForcePathStyle:     aws.Bool(true),
-		S3Disable100Continue: aws.Bool(true),
+func getS3Client(accessKey, secretKey, region, endpoint string) *s3.Client {
+	awsConfig := aws.Config{
+		Region:        region,
+		ClientLogMode: 0,
 		HTTPClient: &http.Client{
 			Transport: transport,
 		},
+		Credentials: aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+			return aws.Credentials{
+				AccessKeyID:     accessKey,
+				SecretAccessKey: secretKey,
+			}, nil
+		}),
+		EndpointResolverWithOptions: aws.EndpointResolverWithOptionsFunc(func(service, region string, opts ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:           endpoint,
+				SigningName:   "s3",
+				SigningRegion: region,
+			}, nil
+		}),
 	}
-	session := session.New(awsConfig)
-	client := s3.New(session)
-	if client == nil {
-		log.Fatalf("FATAL: Unable to create new client.")
-	}
+
+	client := s3.NewFromConfig(awsConfig, func(opts *s3.Options) {
+		opts.UsePathStyle = true
+	})
+
 	return client
 }
 
-func createBucket(accessKey, secretKey, region, endpoint, bucket string) {
+func CreateBucket(accessKey, secretKey, region, endpoint, bucket string) {
 	client := getS3Client(accessKey, secretKey, region, endpoint)
-	// Create our bucket (may already exist without error)
+
 	in := &s3.CreateBucketInput{
 		Bucket: aws.String(bucket),
 	}
-	if _, err := client.CreateBucket(in); err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			switch awsErr.Code() {
-			case "BucketAlreadyOwnedByYou":
-				fallthrough
-			case "BucketAlreadyExists":
-				log.Printf("WARNING: Bucket:%s already exists", bucket)
-				return
-			}
+	if _, err := client.CreateBucket(context.Background(), in); err != nil {
+		errStr := err.Error()
+		if !strings.Contains(errStr, "BucketAlreadyOwnedByYou") && !strings.Contains(errStr, "BucketAlreadyExists") {
+			log.Fatalf("FATAL: Unable to create bucket %s (is your access and secret correct?): %v", bucket, err)
 		}
-		log.Fatalf("FATAL: Unable to create bucket %s (is your access and secret correct?): %v", bucket, err)
 	}
 }
 
@@ -129,17 +123,17 @@ func deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, prefix str
 			Bucket:  aws.String(bucket),
 			Marker:  keyMarker,
 			Prefix:  aws.String(prefix),
-			MaxKeys: aws.Int64(1000),
+			MaxKeys: 1000,
 		}
-		if listObjects, listErr := client.ListObjects(in); listErr == nil {
-			delete := &s3.Delete{Quiet: aws.Bool(true)}
+		if listObjects, listErr := client.ListObjects(context.Background(), in); listErr == nil {
+			delete := &types.Delete{Quiet: true}
 			for _, obj := range listObjects.Contents {
-				delete.Objects = append(delete.Objects, &s3.ObjectIdentifier{Key: obj.Key})
+				delete.Objects = append(delete.Objects, types.ObjectIdentifier{Key: obj.Key})
 			}
 			if len(delete.Objects) > 0 {
 				wg.Add(1)
-				go func(bucket string, delete *s3.Delete) {
-					if _, e := client.DeleteObjects(&s3.DeleteObjectsInput{
+				go func(bucket string, delete *types.Delete) {
+					if _, e := client.DeleteObjects(context.TODO(), &s3.DeleteObjectsInput{
 						Bucket: aws.String(bucket),
 						Delete: delete}); e != nil {
 						err = fmt.Errorf("DeleteObjects unexpected failure: %s", e.Error())
@@ -148,7 +142,7 @@ func deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, prefix str
 				}(bucket, delete)
 			}
 			// Advance to next page
-			if listObjects.IsTruncated == nil || !*listObjects.IsTruncated {
+			if !listObjects.IsTruncated {
 				break
 			}
 			keyMarker = listObjects.NextMarker
@@ -214,15 +208,18 @@ func setSignature(accessKey, secretKey string, req *http.Request) {
 func main() {
 	var accessKey, secretKey, endpoint, bucket, region string
 	var durationSecs, threads, loops int
+	var deleteObject, createBucket bool
 
 	flag.StringVar(&accessKey, "a", "object_user1", "Access key")
 	flag.StringVar(&secretKey, "s", "ChangeMeChangeMeChangeMeChangeMeChangeMe", "Secret key")
 	flag.StringVar(&endpoint, "e", "http://192.168.55.2:9020", "S3 Endpoint URL")
 	flag.StringVar(&bucket, "b", "s3benchmark-test", "Bucket for testing")
-	flag.StringVar(&region, "r", endpoints.CnNorth1RegionID, "Region for testing")
+	flag.StringVar(&region, "r", "", "Region for testing")
 	flag.IntVar(&durationSecs, "d", 60, "Duration of each test in seconds")
 	flag.IntVar(&threads, "t", 1, "Number of threads to run")
 	flag.IntVar(&loops, "l", 1, "Number of times to repeat test")
+	flag.BoolVar(&deleteObject, "delete", true, "Delete Objects")
+	flag.BoolVar(&createBucket, "create-bucket", true, "Crete Bucket")
 	sizeArg := flag.String("z", "128K", "Size of objects in bytes with postfix K, M, and G")
 	flag.Parse()
 
@@ -257,8 +254,13 @@ func main() {
 	//objectDataMd5 := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
 
 	// Create the Bucket and delete the Objects
-	createBucket(accessKey, secretKey, region, endpoint, bucket)
-	deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, hostname)
+	if createBucket {
+		CreateBucket(accessKey, secretKey, region, endpoint, bucket)
+	}
+	if deleteObject {
+		deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, hostname)
+	}
+
 	httpClient := &http.Client{Transport: transport}
 	var totalUploadTime, totalDownloadTime, totalDeleteTime float64
 	var totalUploadCount, totalDownloadCount, totalDeleteCount int32
@@ -353,43 +355,46 @@ func main() {
 			loop, http.MethodGet, downloadCount, downloadTime, bytefmt.ByteSize(uint64(bps)), float64(downloadCount)/downloadTime, downloadFailedCount))
 
 		// Run the delete case
-		starttime = time.Now()
-		endtime = starttime.Add(time.Second * time.Duration(durationSecs))
-		for n := 1; n <= threads; n++ {
-			wg.Add(1)
-			go func() {
-				for {
-					objnum := atomic.AddInt32(&deleteCount, 1)
-					if objnum > uploadCount {
-						break
-					}
-					prefix := fmt.Sprintf("%s/%s/k_%s_%d", endpoint, bucket, hostname, objnum)
-					req, _ := http.NewRequest(http.MethodDelete, prefix, nil)
-					setSignature(accessKey, secretKey, req)
-					if resp, err := httpClient.Do(req); err != nil {
-						log.Fatalf("FATAL: Error deleting object %s: %v", prefix, err)
-					} else if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
-						// OK
-					} else {
-						atomic.AddInt32(&deleteFailedCount, 1)
-						atomic.AddInt32(&deleteCount, -1)
-						if resp.StatusCode != http.StatusServiceUnavailable {
-							fmt.Printf("delete resp: %v\n", resp)
+		if deleteObject {
+			starttime = time.Now()
+			endtime = starttime.Add(time.Second * time.Duration(durationSecs))
+			for n := 1; n <= threads; n++ {
+				wg.Add(1)
+				go func() {
+					for {
+						objnum := atomic.AddInt32(&deleteCount, 1)
+						if objnum > uploadCount {
+							break
+						}
+						prefix := fmt.Sprintf("%s/%s/k_%s_%d", endpoint, bucket, hostname, objnum)
+						req, _ := http.NewRequest(http.MethodDelete, prefix, nil)
+						setSignature(accessKey, secretKey, req)
+						if resp, err := httpClient.Do(req); err != nil {
+							log.Fatalf("FATAL: Error deleting object %s: %v", prefix, err)
+						} else if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+							// OK
+						} else {
+							atomic.AddInt32(&deleteFailedCount, 1)
+							atomic.AddInt32(&deleteCount, -1)
+							if resp.StatusCode != http.StatusServiceUnavailable {
+								fmt.Printf("delete resp: %v\n", resp)
+							}
 						}
 					}
-				}
-				deleteFinish = time.Now()
-				wg.Done()
-			}()
+					deleteFinish = time.Now()
+					wg.Done()
+				}()
+			}
+			wg.Wait()
+			deleteTime := deleteFinish.Sub(starttime).Seconds()
+			totalDeleteTime += deleteTime
+			totalDeleteCount += deleteCount
+			totalDeleteFailedCount += deleteFailedCount
+			logit(fmt.Sprintf("%4d\t%6s\t%9d\t%10.1f\t%11s\t%6.1f\t%7d",
+				loop, http.MethodDelete, deleteCount, deleteTime, "--", float64(uploadCount)/deleteTime, deleteFailedCount))
 		}
-		wg.Wait()
-		deleteTime := deleteFinish.Sub(starttime).Seconds()
-		totalDeleteTime += deleteTime
-		totalDeleteCount += deleteCount
-		totalDeleteFailedCount += deleteFailedCount
-		logit(fmt.Sprintf("%4d\t%6s\t%9d\t%10.1f\t%11s\t%6.1f\t%7d",
-			loop, http.MethodDelete, deleteCount, deleteTime, "--", float64(uploadCount)/deleteTime, deleteFailedCount))
 	}
+
 	if loops > 1 {
 		bps := float64(uint64(totalUploadCount)*objectSize) / totalUploadTime
 		logit(fmt.Sprintf("%4s\t%6s\t%9d\t%10.1f\t%10sB\t%6.1f\t%7d", "AVG", http.MethodPut, totalUploadCount,
