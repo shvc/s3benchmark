@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -15,9 +17,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/endpoints"
-	"github.com/aws/aws-sdk-go-v2/aws/external"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // summary statistics used to summarize first byte and last byte latencies
@@ -63,7 +64,7 @@ var hostname = getHostname()
 var region string
 
 // the endpoint URL if applicable
-var endpoint string
+var endpoint, accessKey, secretKey string
 
 // the script will automatically create an S3 bucket to use for the test, and it tries to get a unique bucket name
 // by generating a sha hash of the hostname
@@ -88,6 +89,22 @@ var cleanupOnly bool
 
 // the S3 SDK client
 var s3Client *s3.Client
+
+var transport http.RoundTripper = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	Dial: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).Dial,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 0,
+	MaxIdleConnsPerHost:   4096,
+	MaxIdleConns:          0,
+	IdleConnTimeout:       time.Minute,
+	TLSClientConfig: &tls.Config{
+		InsecureSkipVerify: true,
+	},
+}
 
 // program entry point
 func main() {
@@ -114,8 +131,10 @@ func parseFlags() {
 	flag.IntVar(&payloadsMax, "size-max", 4, "The maximum object size to test, with 1 = 1 KB, and every increment is a double of the previous value.")
 	flag.IntVar(&samples, "samples", 256, "The number of samples to collect for each test of a single object size and thread count.")
 	flag.StringVar(&bucketName, "bucket", "s3benchmark-test", "Cleans up all the S3 artifacts used by the benchmarks.")
-	flag.StringVar(&region, "region", endpoints.CnNorth1RegionID, "Sets the AWS region to use for the S3 bucket.")
+	flag.StringVar(&region, "region", "", "Sets the AWS region to use for the S3 bucket.")
 	flag.StringVar(&endpoint, "endpoint", "http://192.168.55.2:9020", "Sets the S3 endpoint to use. Only applies to non-AWS, S3-compatible stores.")
+	flag.StringVar(&accessKey, "a", "object_user1", "Access key")
+	flag.StringVar(&secretKey, "s", "ChangeMeChangeMeChangeMeChangeMeChangeMe", "Secret key")
 	fullArg := flag.Bool("full", false, "Runs the full exhaustive test, and overrides the threads and payload arguments.")
 	flag.BoolVar(&throttlingMode, "throttling-mode", false, "Runs a continuous test to find out when EC2 network throttling kicks in.")
 	flag.BoolVar(&cleanupOnly, "cleanup", false, "Cleans all the objects uploaded to S3 for this test.")
@@ -148,46 +167,43 @@ func parseFlags() {
 }
 
 func setupS3Client() {
-	// gets the AWS credentials from the default file or from the EC2 instance profile
-	cfg, err := external.LoadDefaultAWSConfig()
-	if err != nil {
-		panic("Unable to load AWS SDK config: " + err.Error())
+	awsConfig := aws.Config{
+		Region:        region,
+		ClientLogMode: 0,
+		HTTPClient: &http.Client{
+			Transport: transport,
+		},
+		Credentials: aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+			return aws.Credentials{
+				AccessKeyID:     accessKey,
+				SecretAccessKey: secretKey,
+			}, nil
+		}),
+		EndpointResolverWithOptions: aws.EndpointResolverWithOptionsFunc(func(service, region string, opts ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:           endpoint,
+				SigningName:   "s3",
+				SigningRegion: region,
+			}, nil
+		}),
 	}
 
-	// set the SDK region to either the one from the program arguments or else to the same region as the EC2 instance
-	cfg.Region = region
+	s3Client = s3.NewFromConfig(awsConfig, func(opts *s3.Options) {
+		opts.UsePathStyle = true
+	})
 
-	// set the endpoint in the configuration
-	if endpoint != "" {
-		cfg.EndpointResolver = aws.ResolveWithEndpointURL(endpoint)
-	}
-
-	// set a 3-minute timeout for all S3 calls, including downloading the body
-	cfg.HTTPClient = &http.Client{
-		Timeout: time.Second * 180,
-	}
-
-	// crete the S3 client
-	s3Client = s3.New(cfg)
-
-	// custom endpoints don't generally work with the bucket in the host prefix
-	if endpoint != "" {
-		s3Client.ForcePathStyle = true
-	}
 }
 
 func setup() {
 	fmt.Print("\n--- \033[1;32mSETUP\033[0m --------------------------------------------------------------------------------------------------------------------\n\n")
 
 	// try to create the S3 bucket
-	createBucketReq := s3Client.CreateBucketRequest(&s3.CreateBucketInput{
+	_, err := s3Client.CreateBucket(context.Background(), &s3.CreateBucketInput{
 		Bucket: aws.String(bucketName),
-		CreateBucketConfiguration: &s3.CreateBucketConfiguration{
-			LocationConstraint: s3.BucketLocationConstraint(region),
+		CreateBucketConfiguration: &types.CreateBucketConfiguration{
+			LocationConstraint: types.BucketLocationConstraint(region),
 		},
 	})
-
-	_, err := createBucketReq.Send(context.Background())
 
 	// if the error is because the bucket already exists, ignore the error
 	if err != nil && !strings.Contains(err.Error(), "BucketAlreadyOwnedByYou:") {
@@ -209,15 +225,10 @@ func setup() {
 			key := generateS3Key(hostname, t, objectSize)
 
 			// do a HeadObject request to avoid uploading the object if it already exists from a previous test run
-			headReq := s3Client.HeadObjectRequest(&s3.HeadObjectInput{
+			_, err := s3Client.HeadObject(context.Background(), &s3.HeadObjectInput{
 				Bucket: aws.String(bucketName),
 				Key:    aws.String(key),
 			})
-
-			_, err := headReq.Send(context.Background())
-			if err == nil {
-				continue
-			}
 
 			// if other error, exit
 			if err != nil && !strings.Contains(err.Error(), "NotFound:") {
@@ -228,13 +239,11 @@ func setup() {
 			payload := make([]byte, objectSize)
 
 			// do a PutObject request to create the object
-			putReq := s3Client.PutObjectRequest(&s3.PutObjectInput{
+			_, err = s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
 				Bucket: aws.String(bucketName),
 				Key:    aws.String(key),
 				Body:   bytes.NewReader(payload),
 			})
-
-			_, err = putReq.Send(context.Background())
 
 			// if the put fails, exit
 			if err != nil {
@@ -295,13 +304,12 @@ func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][
 				// start the timer to measure the first byte and last byte latencies
 				latencyTimer := time.Now()
 
-				req := s3Client.GetObjectRequest(&s3.GetObjectInput{
+				resp, err := s3Client.GetObject(context.Background(), &s3.GetObjectInput{
 					Bucket: aws.String(bucketName),
 					Key:    aws.String(key),
 				})
-				resp, err := req.Send(context.Background())
 				if err != nil {
-					panic("Failed to get object: " + err.Error())
+
 				}
 
 				// measure the first byte latency
@@ -455,12 +463,10 @@ func cleanup() {
 		// loop over each possible thread to clean up objects from any previous test execution
 		for t := 1; t <= maxThreads; t++ {
 			key := generateS3Key(hostname, t, payloadSize)
-			headReq := s3Client.DeleteObjectRequest(&s3.DeleteObjectInput{
+			_, err := s3Client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
 				Bucket: aws.String(bucketName),
 				Key:    aws.String(key),
 			})
-
-			_, err := headReq.Send(context.Background())
 
 			// if the object doesn't exist, ignore the error
 			if err != nil && !strings.HasPrefix(err.Error(), "NotFound: Not Found") {
