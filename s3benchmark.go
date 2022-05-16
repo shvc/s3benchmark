@@ -34,8 +34,11 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
-// version
-var version = "2.1.1"
+var (
+	// version
+	version         = "2.1.1"
+	notCreateBucket = false
+)
 
 // TODO: avoid different threads download the same object
 
@@ -223,6 +226,7 @@ func main() {
 	flag.IntVar(&durationSecs, "d", 60, "Duration of each test in seconds")
 	flag.IntVar(&threads, "t", 1, "Number of threads to run")
 	flag.IntVar(&loops, "l", 1, "Number of times to repeat test")
+	flag.BoolVar(&notCreateBucket, "not-create-bucket", notCreateBucket, "not create bucket")
 	sizeArg := flag.String("z", "128K", "Size of objects in bytes with postfix K, M, and G")
 	flag.Parse()
 
@@ -257,7 +261,10 @@ func main() {
 	//objectDataMd5 := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
 
 	// Create the Bucket and delete the Objects
-	createBucket(accessKey, secretKey, region, endpoint, bucket)
+	if !notCreateBucket {
+		createBucket(accessKey, secretKey, region, endpoint, bucket)
+	}
+
 	deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, hostname)
 	httpClient := &http.Client{Transport: transport}
 	var totalUploadTime, totalDownloadTime, totalDeleteTime float64
