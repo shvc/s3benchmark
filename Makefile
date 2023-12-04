@@ -1,6 +1,6 @@
 APP?=s3benchmark
 BUILDDATE=$(shell date +'%Y-%m-%dT%H:%M:%SZ')
-VERSION=2.2.$(shell git rev-parse --short HEAD)
+VERSION=2.2.3
 LONGVER=${VERSION}@${BUILDDATE}
 
 LDFLAGS=-ldflags "-s -w -X main.version=${LONGVER}"
