@@ -12,7 +12,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
@@ -36,7 +35,7 @@ import (
 
 var (
 	// version
-	version         = "2.1.1"
+	version         = "2.2.3"
 	notCreateBucket = false
 )
 
@@ -45,10 +44,10 @@ var (
 // transport represent Our HTTP transport used for the roundtripper below
 var transport http.RoundTripper = &http.Transport{
 	Proxy: http.ProxyFromEnvironment,
-	Dial: (&net.Dialer{
+	DialContext: (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-	}).Dial,
+	}).DialContext,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 0,
 	// Allow an unlimited number of idle connections
@@ -56,17 +55,19 @@ var transport http.RoundTripper = &http.Transport{
 	MaxIdleConns:        0, // MaxIdleConns controls the maximum number of idle (keep-alive) connections across all hosts. Zero means no limit.
 	// But limit their idle time
 	IdleConnTimeout: time.Minute,
-	// Ignore TLS errors
+	// Ignore TLS errors (can be overridden with -insecure-skip-tls=false)
 	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 }
 
 func logit(msg string) {
 	fmt.Println(msg)
-	logfile, _ := os.OpenFile("s3benchmark.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
-	if logfile != nil {
-		logfile.WriteString(time.Now().Format(http.TimeFormat) + ": " + msg + "\n")
-		logfile.Close()
+	logfile, err := os.OpenFile("s3benchmark.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+	if err != nil {
+		log.Printf("WARNING: Unable to open log file: %v", err)
+		return
 	}
+	logfile.WriteString(time.Now().Format(http.TimeFormat) + ": " + msg + "\n")
+	logfile.Close()
 }
 
 func getHostname() string {
@@ -217,9 +218,11 @@ func setSignature(accessKey, secretKey string, req *http.Request) {
 func main() {
 	var accessKey, secretKey, endpoint, bucket, region string
 	var durationSecs, threads, loops int
+	var insecureSkipTLS bool
+	var sleepDurationMs int
 
-	flag.StringVar(&accessKey, "a", "object_user1", "Access key")
-	flag.StringVar(&secretKey, "s", "ChangeMeChangeMeChangeMeChangeMeChangeMe", "Secret key")
+	flag.StringVar(&accessKey, "a", "", "Access key")
+	flag.StringVar(&secretKey, "s", "", "Secret key")
 	flag.StringVar(&endpoint, "e", "http://192.168.55.2:9020", "S3 Endpoint URL")
 	flag.StringVar(&bucket, "b", "s3benchmark-test", "Bucket for testing")
 	flag.StringVar(&region, "r", endpoints.CnNorth1RegionID, "Region for testing")
@@ -227,6 +230,8 @@ func main() {
 	flag.IntVar(&threads, "t", 1, "Number of threads to run")
 	flag.IntVar(&loops, "l", 1, "Number of times to repeat test")
 	flag.BoolVar(&notCreateBucket, "not-create-bucket", notCreateBucket, "not create bucket")
+	flag.BoolVar(&insecureSkipTLS, "insecure-skip-tls", true, "Skip TLS verification (insecure)")
+	flag.IntVar(&sleepDurationMs, "sleep-ms", 1000, "Sleep duration between operations in milliseconds")
 	sizeArg := flag.String("z", "128K", "Size of objects in bytes with postfix K, M, and G")
 	flag.Parse()
 
@@ -265,6 +270,11 @@ func main() {
 		createBucket(accessKey, secretKey, region, endpoint, bucket)
 	}
 
+	// Update transport TLS config based on flag
+	if httpTransport, ok := transport.(*http.Transport); ok {
+		httpTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: insecureSkipTLS}
+	}
+
 	deleteAllObjects(accessKey, secretKey, region, endpoint, bucket, hostname)
 	httpClient := &http.Client{Transport: transport}
 	var totalUploadTime, totalDownloadTime, totalDeleteTime float64
@@ -288,12 +298,17 @@ func main() {
 					objnum := atomic.AddInt32(&uploadCount, 1)
 					fileobj := bytes.NewReader(objectData)
 					prefix := fmt.Sprintf("%s/%s/k_%s_%d", endpoint, bucket, hostname, objnum)
-					req, _ := http.NewRequest(http.MethodPut, prefix, fileobj)
+					req, err := http.NewRequest(http.MethodPut, prefix, fileobj)
+					if err != nil {
+						log.Printf("WARNING: Failed to create upload request: %v", err)
+						atomic.AddInt32(&uploadFailedCount, 1)
+						continue
+					}
 					req.Header.Set("Content-Length", strconv.FormatUint(objectSize, 10))
 					//req.Header.Set("Content-MD5", objectDataMd5)
 					setSignature(accessKey, secretKey, req)
 					if resp, err := httpClient.Do(req); err != nil {
-						log.Fatalf("FATAL: Error uploading object %s: %v", prefix, err)
+						log.Printf("WARNING: Error uploading object %s: %v", prefix, err)
 					} else if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 						atomic.AddInt32(&uploadFailedCount, 1)
 						atomic.AddInt32(&uploadCount, -1)
@@ -301,22 +316,26 @@ func main() {
 						if resp.StatusCode != http.StatusServiceUnavailable {
 							fmt.Printf("Upload status %s: resp: %+v\n", resp.Status, resp)
 							if resp.Body != nil {
-								body, _ := ioutil.ReadAll(resp.Body)
+								body, _ := io.ReadAll(resp.Body)
 								fmt.Printf("Body: %s\n", string(body))
+								resp.Body.Close()
 							}
 						}
+						resp.Body.Close()
+					} else {
+						resp.Body.Close()
 					}
-					time.Sleep(time.Second * 1)
+					time.Sleep(time.Duration(sleepDurationMs) * time.Millisecond)
 				}
-				uploadFinish = time.Now()
 				wg.Done()
 			}()
 		}
 		wg.Wait()
+		uploadFinish = time.Now()
 		uploadTime := uploadFinish.Sub(starttime).Seconds()
 		totalUploadTime += uploadTime
 		totalUploadCount += uploadCount
-		totalUploadFailedCount += totalUploadFailedCount
+		totalUploadFailedCount += uploadFailedCount
 		bps := float64(uint64(uploadCount)*objectSize) / uploadTime
 		logit(fmt.Sprintf("%4d\t%6s\t%9d\t%10.1f\t%10sB\t%6.1f\t%7d",
 			loop, http.MethodPut, uploadCount, uploadTime, bytefmt.ByteSize(uint64(bps)), float64(uploadCount)/uploadTime, uploadFailedCount))
@@ -331,37 +350,45 @@ func main() {
 					atomic.AddInt32(&downloadCount, 1)
 					objnum := rand.Int31n(uploadCount) + 1
 					prefix := fmt.Sprintf("%s/%s/k_%s_%d", endpoint, bucket, hostname, objnum)
-					req, _ := http.NewRequest(http.MethodGet, prefix, nil)
+					req, err := http.NewRequest(http.MethodGet, prefix, nil)
+					if err != nil {
+						log.Printf("WARNING: Failed to create download request: %v", err)
+						atomic.AddInt32(&downloadFailedCount, 1)
+						continue
+					}
 					setSignature(accessKey, secretKey, req)
 					if resp, err := httpClient.Do(req); err != nil {
-						log.Fatalf("FATAL: Error downloading object %s: %v", prefix, err)
+						log.Printf("WARNING: Error downloading object %s: %v", prefix, err)
+						atomic.AddInt32(&downloadFailedCount, 1)
+						atomic.AddInt32(&downloadCount, -1)
 					} else if resp.StatusCode == http.StatusOK {
-						io.Copy(ioutil.Discard, resp.Body)
+						io.Copy(io.Discard, resp.Body)
+						resp.Body.Close()
 					} else {
 						atomic.AddInt32(&downloadCount, -1)
 						atomic.AddInt32(&downloadFailedCount, 1)
 						if resp.StatusCode != http.StatusServiceUnavailable {
-							fmt.Printf("Upload status %s: resp: %+v\n", resp.Status, resp)
+							fmt.Printf("Download status %s: resp: %+v\n", resp.Status, resp)
 						}
+						resp.Body.Close()
 					}
-					time.Sleep(time.Second * 1)
+					time.Sleep(time.Duration(sleepDurationMs) * time.Millisecond)
 				}
-				downloadFinish = time.Now()
 				wg.Done()
 			}()
 		}
 		wg.Wait()
+		downloadFinish = time.Now()
 		downloadTime := downloadFinish.Sub(starttime).Seconds()
 		totalDownloadTime += downloadTime
 		totalDownloadCount += downloadCount
-		totalDownloadFailedCount += totalDownloadFailedCount
+		totalDownloadFailedCount += downloadFailedCount
 		bps = float64(uint64(downloadCount)*objectSize) / downloadTime
 		logit(fmt.Sprintf("%4d\t%6s\t%9d\t%10.1f\t%10sB\t%6.1f\t%7d",
 			loop, http.MethodGet, downloadCount, downloadTime, bytefmt.ByteSize(uint64(bps)), float64(downloadCount)/downloadTime, downloadFailedCount))
 
 		// Run the delete case
 		starttime = time.Now()
-		endtime = starttime.Add(time.Second * time.Duration(durationSecs))
 		for n := 1; n <= threads; n++ {
 			wg.Add(1)
 			go func() {
@@ -371,25 +398,34 @@ func main() {
 						break
 					}
 					prefix := fmt.Sprintf("%s/%s/k_%s_%d", endpoint, bucket, hostname, objnum)
-					req, _ := http.NewRequest(http.MethodDelete, prefix, nil)
+					req, err := http.NewRequest(http.MethodDelete, prefix, nil)
+					if err != nil {
+						log.Printf("WARNING: Failed to create delete request: %v", err)
+						atomic.AddInt32(&deleteFailedCount, 1)
+						continue
+					}
 					setSignature(accessKey, secretKey, req)
 					if resp, err := httpClient.Do(req); err != nil {
-						log.Fatalf("FATAL: Error deleting object %s: %v", prefix, err)
+						log.Printf("WARNING: Error deleting object %s: %v", prefix, err)
+						atomic.AddInt32(&deleteFailedCount, 1)
+						atomic.AddInt32(&deleteCount, -1)
 					} else if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
 						// OK
+						resp.Body.Close()
 					} else {
 						atomic.AddInt32(&deleteFailedCount, 1)
 						atomic.AddInt32(&deleteCount, -1)
 						if resp.StatusCode != http.StatusServiceUnavailable {
 							fmt.Printf("delete resp: %v\n", resp)
 						}
+						resp.Body.Close()
 					}
 				}
-				deleteFinish = time.Now()
 				wg.Done()
 			}()
 		}
 		wg.Wait()
+		deleteFinish = time.Now()
 		deleteTime := deleteFinish.Sub(starttime).Seconds()
 		totalDeleteTime += deleteTime
 		totalDeleteCount += deleteCount
